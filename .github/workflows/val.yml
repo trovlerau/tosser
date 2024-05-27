@@ -1,0 +1,126 @@
+# Reusable GitHub Action Workflow
+name: Compliance Conductor
+
+on:
+  workflow_call:
+    inputs:
+      github_workflow_event:
+        description: |
+          The name of the GitHub Event.
+          Most commonly, it will be set with the GitHub variable 'github.event_name'.
+        required: true
+        type: string
+      repository:
+        description: 'The GitHub repository'
+        required: true
+        type: string
+      commit_sha:
+        description: 'The commit SHA to tag'
+        required: true
+        type: string
+
+    secrets:
+      GH_TOKEN:
+        description: 'GitHub Token passed from parent workflow'
+        required: true
+
+jobs:
+
+  github_action_sha_pinning:
+    name: Ensure GitHub Action Sha Pinning
+    runs-on: ubuntu-24.04
+    steps:
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Ensure SHA pinned actions
+        uses: zgosalvez/github-actions-ensure-sha-pinned-actions@40e45e738b3cad2729f599d8afc6ed02184e1dbd # v3.0.5
+        with:
+          allowlist: |
+            actions/
+            aws-actions/
+
+  branch_commit_validation:
+    needs: [github_action_sha_pinning]
+    name: Compliance Check
+    runs-on: ubuntu-22.04
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get current branch name
+        id: branch-names
+        uses: tj-actions/branch-names@6871f53176ad61624f978536bbf089c574dc19a2 # v8.0.1
+
+      - name: Validate branch name
+        if: steps.branch-names.outputs.is_default == 'false'
+        run: |
+          set -x
+          branch="${{ steps.branch-names.outputs.current_branch }}"
+
+          echo "This is branch: $branch"
+
+          pattern="^[A-Za-z]{2,4}-[0-9]+(-[A-Za-z0-9-]+)*$"
+          if [[ "$branch" =~ $pattern ]]; then
+            echo "The branch name '$branch' conforms to the naming convention."
+          else
+            echo "The branch name '$branch' does not conform to the naming convention."
+            exit 1
+          fi
+          set +x
+
+      - name: Ensure Compliant Git commit message - contains ticket number
+        uses: gsactions/commit-message-checker@16fa2d5de096ae0d35626443bcd24f1e756cafee # v2.0.0
+        with:
+          error: 'The first line of the commit message must contain the ticket number followed by a colon'
+          pattern: '[A-Z]{2,4}-\d+:\s'
+
+      - name: Ensure Compliant Git commit message - length
+        uses: gsactions/commit-message-checker@16fa2d5de096ae0d35626443bcd24f1e756cafee # v2.0.0
+        with:
+          error: 'The maximum line length of 72 characters is exceeded.'
+          pattern: '^.{0,72}$'
+          excludeDescription: 'true'
+          excludeTitle: 'true'
+
+  git_commit_versioning:
+    needs: [github_action_sha_pinning, branch_commit_validation]
+    if: inputs.github_workflow_event == 'push'
+    name: Git Commit Versioning
+    runs-on: ubuntu-24.04
+    steps:
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate Semantic version
+        uses: paulhatch/semantic-version@a8f8f59fd7f0625188492e945240f12d7ad2dca3 # v5.4.0
+        id: semvar
+        with:
+          tag_prefix: v
+          # A string which, if present in a git commit, indicates that a change represents a
+          # major (breaking) change, supports regular expressions wrapped with '/'
+          major_pattern: "(MAJOR)"
+          # Same as above except indicating a minor change, supports regular expressions wrapped with '/'
+          minor_pattern: "(MINOR)"
+          bump_each_commit: true
+          search_commit_body: true
+          user_format_type: json
+
+      - name: Create tag using Semantic version
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+          script: |
+            const tagName = '${{ steps.semvar.outputs.version_tag }}';
+            const [owner, repo] = '${{ inputs.repository }}'.split('/');
+            await github.rest.git.createRef({
+              owner: owner,
+              repo: repo,
+              ref: `refs/tags/${tagName}`,
+              sha: '${{ inputs.commit_sha }}'
+            });
